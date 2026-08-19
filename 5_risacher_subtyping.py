@@ -7,10 +7,14 @@ Computes Risacher-style MRI subtypes from:
   - subject-level cohort metadata
   - a volumetric ROI table
 
+Voted-FN vs Voted-TP subtype composition is compared with the
+Fisher exact test, with Cramer's V as the effect size.
+
 All three input paths are configurable by CLI argument or environment variable.
 """
 
 import argparse
+import math
 import os
 from pathlib import Path
 import warnings
@@ -155,6 +159,76 @@ def cramers_v(contingency_table):
     return chi2, p_val, dof, v
 
 
+def _table_log_prob(table):
+    """Log probability of a contingency table under fixed margins."""
+    table = np.asarray(table, dtype=np.int64)
+    row_totals = table.sum(axis=1)
+    col_totals = table.sum(axis=0)
+    total = table.sum()
+    log_p = (
+        sum(math.lgamma(r + 1) for r in row_totals)
+        + sum(math.lgamma(c + 1) for c in col_totals)
+        - math.lgamma(total + 1)
+    )
+    return log_p - sum(math.lgamma(x + 1) for x in table.ravel())
+
+
+def fisher_exact_rxc(contingency_table, max_tables=2_000_000):
+    table = np.asarray(contingency_table, dtype=np.int64)
+    if table.shape[0] != 2:
+        raise ValueError(f"Expected a 2 x C table, got shape {table.shape}.")
+
+    col_totals = table.sum(axis=0)
+    row_totals = table.sum(axis=1)
+    n_cols = table.shape[1]
+
+    # Enumerate over the smaller row to keep the reference set small.
+    small_row = int(np.argmin(row_totals))
+    m = int(row_totals[small_row])
+
+    n_tables = math.comb(m + n_cols - 1, n_cols - 1)
+    if n_tables > max_tables:
+        raise ValueError(
+            f"Reference set too large to enumerate ({n_tables:,} tables); "
+            "the exact test is not practical for this table."
+        )
+
+    log_p_observed = _table_log_prob(table)
+    p_value = 0.0
+    total_prob = 0.0
+
+    def walk(col_idx, remaining, row):
+        nonlocal p_value, total_prob
+        if col_idx == n_cols - 1:
+            if remaining > col_totals[col_idx]:
+                return
+            row = row + [remaining]
+            candidate = np.array(
+                [row, [col_totals[j] - row[j] for j in range(n_cols)]],
+                dtype=np.int64,
+            )
+            if small_row == 1:
+                candidate = candidate[::-1]
+            log_p = _table_log_prob(candidate)
+            prob = math.exp(log_p)
+            total_prob += prob
+            # Sum every table at most as probable as the observed one.
+            if log_p <= log_p_observed + 1e-9:
+                p_value += prob
+            return
+        for count in range(min(remaining, int(col_totals[col_idx])) + 1):
+            walk(col_idx + 1, remaining - count, row + [count])
+
+    walk(0, m, [])
+
+    if not math.isclose(total_prob, 1.0, abs_tol=1e-6):
+        raise RuntimeError(
+            f"Reference set probabilities summed to {total_prob!r}, expected 1.0."
+        )
+
+    return min(p_value, 1.0), n_tables
+
+
 def mannwhitney_rrb(a, b):
     res = stats.mannwhitneyu(a, b, alternative="two-sided")
     n1, n2 = len(a), len(b)
@@ -225,15 +299,30 @@ def main():
             composition[subtype] = 0
     composition = composition[["tAD", "LP", "HpSp", "MA"]]
     proportions = composition.div(composition.sum(axis=1), axis=0)
-    chi2, p_val, dof, cramers = cramers_v(composition)
+    chi2, p_chi2, dof, cramers = cramers_v(composition)
+    p_fisher, n_ref_tables = fisher_exact_rxc(composition)
+
+    expected = stats.contingency.expected_freq(composition.values)
+    n_small_expected = int((expected < 5).sum())
 
     summary_df = proportions.copy()
     summary_df["chi2"] = chi2
-    summary_df["p_chi2"] = p_val
+    summary_df["p_chi2"] = p_chi2
+    summary_df["p_fisher_exact"] = p_fisher
     summary_df["cramers_v"] = cramers
     summary_df.to_csv(OUTPUT_DIR / "subtype_composition_table.csv")
     print(composition.to_string())
-    print(f"\n    chi2={chi2:.3f}, p={p_val:.4f}, dof={dof}, Cramer's V={cramers:.3f}")
+    print(
+        f"\n    Fisher-Freeman-Halton exact p={p_fisher:.4f} "
+        f"(reference set: {n_ref_tables:,} tables)"
+    )
+    print(f"    Cramer's V={cramers:.3f}  (from chi2={chi2:.3f}, dof={dof})")
+    print(f"    chi-square p={p_chi2:.4f} (reported for reference)")
+    if n_small_expected:
+        print(
+            f"    Note: {n_small_expected} of {expected.size} expected counts are < 5, "
+            "so the exact p-value is the one to report."
+        )
 
     print("\n[5] HV:CTV ratio comparison...")
     ad_df["hv_ctv_ratio"] = ad_df["adj_HV"] / (ad_df["adj_CTV"] + 1e-8)
